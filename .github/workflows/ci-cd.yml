@@ -1,0 +1,184 @@
+name: CI/CD Pipeline - Bank Churn API
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: [3.9, 3.10, 3.11]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Lint with flake8
+      run: |
+        pip install flake8
+        # stop the build if there are Python syntax errors or undefined names
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+    - name: Run tests with pytest
+      run: |
+        pip install pytest pytest-cov
+        pytest tests/ --cov=app --cov-report=xml --cov-report=html
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+
+  build-and-deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Deploy to Azure
+      run: |
+        echo "🚀 Déploiement sur Azure Container Apps..."
+        
+        # Installation Azure CLI
+        curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+        
+        # Connexion à Azure
+        az login --service-principal \
+          --tenant "${{ secrets.AZURE_TENANT_ID }}" \
+          --username "${{ secrets.AZURE_CLIENT_ID }}" \
+          --password "${{ secrets.AZURE_CLIENT_SECRET }}"
+        
+        # Configuration des variables
+        RESOURCE_GROUP="${{ secrets.AZURE_RESOURCE_GROUP }}"
+        CONTAINER_APP_NAME="${{ secrets.AZURE_CONTAINER_APP_NAME }}"
+        REGISTRY_NAME="${{ secrets.AZURE_REGISTRY_NAME }}"
+        IMAGE_TAG="${{ github.sha }}"
+        
+        # Connexion à ACR
+        az acr login --name $REGISTRY_NAME
+        
+        # Pull et tag de l'image
+        docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$IMAGE_TAG
+        docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$IMAGE_TAG $REGISTRY_NAME.azurecr.io/churn-api:$IMAGE_TAG
+        docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$IMAGE_TAG $REGISTRY_NAME.azurecr.io/churn-api:latest
+        
+        # Push vers ACR
+        docker push $REGISTRY_NAME.azurecr.io/churn-api:$IMAGE_TAG
+        docker push $REGISTRY_NAME.azurecr.io/churn-api:latest
+        
+        # Mise à jour de la Container App
+        az containerapp update \
+          --name $CONTAINER_APP_NAME \
+          --resource-group $RESOURCE_GROUP \
+          --image $REGISTRY_NAME.azurecr.io/churn-api:$IMAGE_TAG
+        
+        echo "✅ Déploiement terminé avec succès !"
+
+    - name: Health check
+      run: |
+        echo "🏥 Vérification de la santé de l'application..."
+        sleep 30  # Attendre le déploiement
+        
+        APP_URL="https://${{ secrets.AZURE_CONTAINER_APP_NAME }}.azurecontainerapps.io"
+        
+        # Test du endpoint health
+        curl -f $APP_URL/health || exit 1
+        echo "✅ Health check passé"
+        
+        # Test du endpoint predict
+        curl -f -X POST "$APP_URL/predict" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "CreditScore": 700,
+            "Age": 40,
+            "Tenure": 7,
+            "Balance": 80000,
+            "NumOfProducts": 3,
+            "HasCrCard": 1,
+            "IsActiveMember": 0,
+            "EstimatedSalary": 90000,
+            "Geography_Germany": 1,
+            "Geography_Spain": 0
+          }' || exit 1
+        echo "✅ Prediction test passé"
+
+  notify:
+    needs: [test, build-and-deploy]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+    - name: Notify on success
+      if: needs.build-and-deploy.result == 'success'
+      run: |
+        echo "🎉 Pipeline réussi ! L'API est déployée et fonctionnelle."
+
+    - name: Notify on failure
+      if: needs.test.result == 'failure' || needs.build-and-deploy.result == 'failure'
+      run: |
+        echo "❌ Pipeline échoué ! Vérifiez les logs pour plus de détails."
+        exit 1
